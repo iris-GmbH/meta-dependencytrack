@@ -17,6 +17,26 @@ DEPENDENCYTRACK_API_URL ??= "http://localhost:8081/api"
 DEPENDENCYTRACK_API_KEY ??= ""
 DEPENDENCYTRACK_SBOM_PROCESSING_TIMEOUT ??= "1200"
 
+# resolve CVE_CHECK_IGNORE and CVE_STATUS_GROUPS,
+# taken from https://git.yoctoproject.org/poky/commit/meta/classes/cve-check.bbclass?id=be9883a92bad0fe4c1e9c7302c93dea4ac680f8c
+python () {
+    # Fallback all CVEs from CVE_CHECK_IGNORE to CVE_STATUS
+    cve_check_ignore = d.getVar("CVE_CHECK_IGNORE")
+    if cve_check_ignore:
+        bb.warn("CVE_CHECK_IGNORE is deprecated in favor of CVE_STATUS")
+        for cve in (d.getVar("CVE_CHECK_IGNORE") or "").split():
+            d.setVarFlag("CVE_STATUS", cve, "ignored")
+
+    # Process CVE_STATUS_GROUPS to set multiple statuses and optional detail or description at once
+    for cve_status_group in (d.getVar("CVE_STATUS_GROUPS") or "").split():
+        cve_group = d.getVar(cve_status_group)
+        if cve_group is not None:
+            for cve in cve_group.split():
+                d.setVarFlag("CVE_STATUS", cve, d.getVarFlag(cve_status_group, "status"))
+        else:
+            bb.warn("CVE_STATUS_GROUPS contains undefined variable %s" % cve_status_group)
+}
+
 python do_dependencytrack_init() {
     import uuid
     from datetime import datetime
@@ -54,11 +74,40 @@ python do_dependencytrack_init() {
 addhandler do_dependencytrack_init
 do_dependencytrack_init[eventmask] = "bb.event.BuildStarted"
 
+def append_to_vex_vulnerabilities(vex, cve, state, bom_ref):
+    from oe.cve_check import decode_cve_status
+
+    _, detail, description = decode_cve_status(d.cve)
+    detail_string = ""
+    if detail:
+      detail_string += f"CVE DETAIL: {detail}\n"
+    if description:
+      detail_string += f"CVE DESCRIPTION: {description}\n"
+
+    vex["vulnerabilities"].append({
+        "id": cve,
+        # vex documents require a valid source, see https://github.com/DependencyTrack/dependency-track/issues/2977
+        # this should always be NVD for yocto CVEs.
+        "source": {"name": "NVD", "url": "https://nvd.nist.gov/"},
+        "analysis": {
+            "state": state,
+            "detail": detail_string
+        },
+        # ref needs to be in bom-link format, however the uuid does not actually have to match the SBOM document uuid,
+        # see https://github.com/DependencyTrack/dependency-track/issues/1872#issuecomment-1254265425
+        # This is not ideal, as $state will be applied to all components within the project containing the CVE,
+        # however component specific resolving seems not to work at the moment.
+        "affects": [{"ref": f"urn:cdx:{str(uuid.uuid4())}/1#{bom_ref}"}]
+    })
+
+
 python do_dependencytrack_collect() {
     import json
     import uuid
     import oe.cve_check
     from pathlib import Path
+
+    from oe.cve_check import decode_cve_status
 
     # load the bom
     name = d.getVar("CVE_PRODUCT")
@@ -80,40 +129,26 @@ python do_dependencytrack_collect() {
                 "bom-ref": bom_ref
             })
 
-            # populate vex file with patched CVEs
-            for _, patched_cve in enumerate(oe.cve_check.get_patched_cves(d)):
-                bb.debug(2, f"Found patch for CVE {patched_cve} in {name}@{version}")
-                vex["vulnerabilities"].append({
-                    "id": patched_cve,
-                    # vex documents require a valid source, see https://github.com/DependencyTrack/dependency-track/issues/2977
-                    # this should always be NVD for yocto CVEs.
-                    "source": {"name": "NVD", "url": "https://nvd.nist.gov/"},
-                    "analysis": {"state": "resolved"},
-                    # ref needs to be in bom-link format, however the uuid does not actually have to match the SBOM document uuid,
-                    # see https://github.com/DependencyTrack/dependency-track/issues/1872#issuecomment-1254265425
-                    # This is not ideal, as "resolved" will be applied to all components within the project containing the CVE,
-                    # however component specific resolving seems not to work at the moment.
-                    "affects": [{"ref": f"urn:cdx:{str(uuid.uuid4())}/1#{bom_ref}"}]
-                })
-            # populate vex file with ignored CVEs defined in CVE_CHECK_IGNORE
-            # TODO: In newer versions of Yocto CVE_CHECK_IGNORE is deprecated in favour of CVE_STATUS, which we should also take into account here
-            cve_check_ignore = d.getVar("CVE_CHECK_IGNORE")
-            if cve_check_ignore is not None:
-                for ignored_cve in cve_check_ignore.split():
-                    bb.debug(2, f"Found ignore statement for CVE {ignored_cve} in {name}@{version}")
-                    vex["vulnerabilities"].append({
-                        "id": ignored_cve,
-                        # vex documents require a valid source, see https://github.com/DependencyTrack/dependency-track/issues/2977
-                        # this should always be NVD for yocto CVEs.
-                        "source": {"name": "NVD", "url": "https://nvd.nist.gov/"},
-                        # setting not-affected state for ignored CVEs
-                        "analysis": {"state": "not_affected"},
-                        # ref needs to be in bom-link format, however the uuid does not actually have to match the SBOM document uuid,
-                        # see https://github.com/DependencyTrack/dependency-track/issues/1872#issuecomment-1254265425
-                        # This is not ideal, as "resolved" will be applied to all components within the project containing the CVE,
-                        # however component specific resolving seems not to work at the moment.
-                        "affects": [{"ref": f"urn:cdx:{str(uuid.uuid4())}/1#{bom_ref}"}]
-                    })
+            # populate vex file with details from CVE_STATUS
+            cve_ignored = []
+            cve_patched = []
+            for cve in (d.getVarFlags("CVE_STATUS") or {}):
+                decoded_status, _, _ = decode_cve_status(d, cve)
+                if decoded_status == "Patched":
+                    cve_patched.append(cve)
+                if decoded_status == "Ignored":
+                    cve_ignored.append(cve)
+
+            for cve in cve_patched:
+                bb.debug(2, f"Found patch for CVE {cve} in {name}@{version}")
+                # map Yoctos "Patched" to Dependencytracks "resolved"
+                state = "resolved"
+                append_to_vex_vulnerabilities(vex, cve, state, bom_ref)
+            for cve in cve_ignored:
+                bb.debug(2, f"Found ignore statement for CVE {cve} in {name}@{version}")
+                # map Yoctos "Ignored" to Dependencytracks "not_affected"
+                state = "not_affected"
+                append_to_vex_vulnerabilities(vex, cve, state, bom_ref)
     # write it back to the deploy directory
     write_json(d.getVar("DEPENDENCYTRACK_SBOM"), sbom)
     write_json(d.getVar("DEPENDENCYTRACK_VEX"), vex)
